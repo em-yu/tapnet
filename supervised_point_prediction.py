@@ -826,7 +826,9 @@ class SupervisedPointPrediction(task.Task):
         pad_extra_frames (optional): the number of pad frames that were added
           to reach num_frames.
     """
-    query_mode = 'first' if 'q_first' in mode else 'strided'
+    # query_mode = 'first' if 'q_first' in mode else 'strided'
+    query_mode = 'first'
+    print("QUERY MODE", query_mode)
     if 'eval_kubric_train' in mode:
       yield from evaluation_datasets.create_kubric_eval_train_dataset(mode)
     elif 'eval_kubric' in mode:
@@ -999,71 +1001,97 @@ class SupervisedPointPrediction(task.Task):
         mode=mode,
         input_key=input_key,
     )
+
+    # Additional storage of the tracks, for export purpose
+    pred_tracks = {}
+    pred_occluded = {}
+
     for inputs in self._build_eval_input(mode):
-      batch_size = inputs[input_key]['video'].shape[0]  # pytype: disable=attribute-error  # 'video' entry is array-valued
-      num_samples += batch_size
-      scalars, viz = eval_batch_fn(params, state, inputs, rng)
-      write_viz = batch_id < 10
-      if 'eval_davis_points' in mode or 'eval_robotics_points' in mode:
-        # Only write videos sometimes for the small datasets; otherwise
-        # there will be a crazy number of videos dumped.
-        write_viz = write_viz and (global_step % 10 == 0)
-      if 'eval_jhmdb' in mode:
-        pix_pts = viz['tracks']
-        grid_size = np.array([
-            inputs[input_key]['im_size'][1],
-            inputs[input_key]['im_size'][0],
-        ])
-        pix_pts = transforms.convert_grid_coordinates(
-            pix_pts,
-            (tapnet_model.TRAIN_SIZE[2], tapnet_model.TRAIN_SIZE[1]),
-            grid_size,
-        )
-        mean_scalars = self._eval_jhmdb(
-            pix_pts,
-            inputs[input_key]['gt_pose'],
-            inputs[input_key]['gt_pose_orig'],
-            inputs[input_key]['im_size'],
-            inputs[input_key]['fname'],
-            is_first=batch_id == 0,
-        )
-        scalars = {}
-      if write_viz:
-        pix_pts = viz['tracks']
-        targ_pts = None
-        if 'eval_kinetics_points' in mode:
-          targ_pts = inputs[input_key]['target_points']
-        outname = [
-            f'{outdir}/{x}.mp4'
-            for x in range(batch_size * batch_id, batch_size * (batch_id + 1))
-        ]
-        write_visualization(
-            (inputs[input_key]['video'] + 1.0) * (255.0 / 2.0),
-            pix_pts,
-            jax.nn.sigmoid(viz['occlusion']),
-            outname,
-            gt_points=targ_pts,
-            gt_occluded=inputs[input_key]['occluded'],
-            trackgroup=inputs[input_key]['trackgroup']
-            if 'trackgroup' in inputs[input_key]
-            else None,
-        )
-      del viz
+      # if batch_id not in [0, 10, 11, 12, 15, 17]:
+      if True:
+        batch_size = inputs[input_key]['video'].shape[0]  # pytype: disable=attribute-error  # 'video' entry is array-valued
+        num_samples += batch_size
+        scalars, viz = eval_batch_fn(params, state, inputs, rng)
+        write_viz = batch_id < 10
+        print("batch id", batch_id)
+        print("mean results for this video", scalars)
+        print("num_samples", num_samples)
+        if 'eval_davis_points' in mode or 'eval_robotics_points' in mode:
+          # Only write videos sometimes for the small datasets; otherwise
+          # there will be a crazy number of videos dumped.
+          write_viz = write_viz and (global_step % 10 == 0)
 
-      batch_id += 1
-      logging.info('eval batch: %d', batch_id)
+        if 'eval_jhmdb' in mode:
+          pix_pts = viz['tracks']
+          grid_size = np.array([
+              inputs[input_key]['im_size'][1],
+              inputs[input_key]['im_size'][0],
+          ])
+          pix_pts = transforms.convert_grid_coordinates(
+              pix_pts,
+              (tapnet_model.TRAIN_SIZE[2], tapnet_model.TRAIN_SIZE[1]),
+              grid_size,
+          )
+          mean_scalars = self._eval_jhmdb(
+              pix_pts,
+              inputs[input_key]['gt_pose'],
+              inputs[input_key]['gt_pose_orig'],
+              inputs[input_key]['im_size'],
+              inputs[input_key]['fname'],
+              is_first=batch_id == 0,
+          )
+          scalars = {}
+        write_viz = True
+        if write_viz:
+          pix_pts = viz['tracks']
+          targ_pts = None
+          if 'eval_kinetics_points' in mode:
+            targ_pts = inputs[input_key]['target_points']
+          outname = [
+              f'{outdir}/{x}.mp4'
+              for x in range(batch_size * batch_id, batch_size * (batch_id + 1))
+          ]
+          # write_visualization(
+          #     (inputs[input_key]['video'] + 1.0) * (255.0 / 2.0),
+          #     pix_pts,
+          #     jax.nn.sigmoid(viz['occlusion']),
+          #     outname,
+          #     gt_points=targ_pts,
+          #     gt_occluded=inputs[input_key]['occluded'],
+          #     trackgroup=inputs[input_key]['trackgroup']
+          #     if 'trackgroup' in inputs[input_key]
+          #     else None,
+          # )
+          np.savez(path.join("out" , f"{batch_id:02d}_trajectories"),
+                pred_trajectories_2d = pix_pts,
+                pred_occlusions = viz['occlusion'],
+                video_id=batch_id
+            )
+        del viz
 
-      # Accumulate the sum of scalars for each step.
-      scalars = jax.tree_map(lambda x: jnp.sum(x, axis=0), scalars)
-      if summed_scalars is None:
-        summed_scalars = scalars
+        # batch_id += 1
+        logging.info('eval batch: %d', batch_id)
+
+        # Accumulate the sum of scalars for each step.
+        scalars = jax.tree_map(lambda x: jnp.sum(x, axis=0), scalars)
+        if summed_scalars is None:
+          summed_scalars = scalars
+        else:
+          summed_scalars = jax.tree_map(jnp.add, summed_scalars, scalars)
+
+        if 'eval_jhmdb' not in mode:
+          mean_scalars = jax.tree_map(lambda x: x / num_samples, summed_scalars)
+        logging.info(mean_scalars)
       else:
-        summed_scalars = jax.tree_map(jnp.add, summed_scalars, scalars)
+        logging.info('skipping video: %d', batch_id)
+        
+      batch_id += 1
 
-      if 'eval_jhmdb' not in mode:
-        mean_scalars = jax.tree_map(lambda x: x / num_samples, summed_scalars)
-      logging.info(mean_scalars)
     logging.info(evaluation_datasets.latex_table(mean_scalars))
+
+    mean_scalars_2 = jax.tree_map(lambda x: x / num_samples, summed_scalars)
+    logging.info(evaluation_datasets.latex_table(mean_scalars_2))
+
 
     return mean_scalars
 
